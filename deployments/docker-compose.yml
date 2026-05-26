@@ -1,0 +1,59 @@
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.5
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - '1'
+      - --memory
+      - '1G'
+      - --reserve-memory
+      - '0M'
+      - --node-id
+      - '0'
+      - --check=false
+      - --kafka-addr
+      - '0.0.0.0:9092'
+      - --advertise-kafka-addr
+      - 'redpanda:9092'
+      - --rpc-addr
+      - '0.0.0.0:33145'
+      - --advertise-rpc-addr
+      - 'redpanda:33145'
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+
+  init-kafka:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.5
+    depends_on:
+      - redpanda
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      sleep 5;
+      rpk topic create search_log --brokers redpanda:9092 || true;
+      "
+
+  trending-service:
+    build: ..
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC: search_log
+      KAFKA_GROUP_ID: trending-search-consumer
+      HTTP_PORT: "8080"
+      WINDOW_SLOTS: "30"
+      SLOT_DURATION_SEC: "10"
+      TOP_N: "100"
+      TOP_K: "300"
+      RECALC_INTERVAL_MS: "500"
+      RATE_LIMIT_IP: "0.5"
+      RATE_LIMIT_USER: "0.166"
+      RATE_LIMIT_BURST: "5"
+      QUARANTINE_SEC: "60"
+    depends_on:
+      - init-kafka

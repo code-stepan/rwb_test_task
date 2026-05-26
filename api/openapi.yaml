@@ -1,0 +1,272 @@
+openapi: "3.0.3"
+info:
+  title: Trending Search Service
+  description: |
+    High-performance микросервис для агрегации популярных поисковых запросов
+    в реальном времени. Принимает поток событий из Kafka/Redpanda, фильтрует
+    накрутки (4 уровня антифрода) и стоп-слова, отдаёт топ-N запросов через
+    HTTP API с latency < 1ms (p99).
+  version: "1.0.0"
+  contact:
+    name: Wildberries Search Team
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+paths:
+  /api/v1/trends:
+    get:
+      summary: Топ популярных поисковых запросов
+      description: |
+        Возвращает предварительно вычисленный топ-N запросов.
+        Данные кэшируются и пересчитываются каждые 500ms.
+        HTTP-ответ — pre-serialized JSON, zero-copy на горячем пути.
+      operationId: getTrends
+      parameters:
+        - name: limit
+          in: query
+          description: Максимальное количество запросов в ответе (default=100, max=100)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 100
+      responses:
+        "200":
+          description: Успешный ответ с топом запросов
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrendsResponse"
+        "503":
+          description: Сервис ещё не готов (первый пересчёт не завершён)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/stoplist:
+    get:
+      summary: Список стоп-слов
+      description: Возвращает все точные слова и паттерны стоп-листа.
+      operationId: listStoplist
+      responses:
+        "200":
+          description: Список стоп-слов
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoplistResponse"
+
+    post:
+      summary: Добавить слово в стоп-лист
+      description: |
+        Добавляет слово для точного совпадения (exact) или подстроки (contains).
+        При добавлении триггерится немедленный пересчёт топа.
+      operationId: addStoplist
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StoplistAddRequest"
+      responses:
+        "201":
+          description: Слово добавлено
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "400":
+          description: Некорректный JSON
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/stoplist/{word}:
+    delete:
+      summary: Удалить точное стоп-слово
+      description: |
+        Удаляет слово из списка точных совпадений.
+        При удалении триггерится немедленный пересчёт топа.
+      operationId: removeStoplistExact
+      parameters:
+        - name: word
+          in: path
+          required: true
+          description: Точное стоп-слово для удаления
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Слово удалено
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+  /api/v1/stoplist/pattern/{word}:
+    delete:
+      summary: Удалить паттерн из стоп-листа
+      description: |
+        Удаляет паттерн из списка подстрок.
+        При удалении триггерится немедленный пересчёт топа.
+      operationId: removeStoplistPattern
+      parameters:
+        - name: word
+          in: path
+          required: true
+          description: Паттерн для удаления
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Паттерн удалён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+  /health:
+    get:
+      summary: Health check
+      description: |
+        Liveness: всегда 200.
+        Readiness: 200 только если consumer подключён и первый топ рассчитан.
+      operationId: healthCheck
+      responses:
+        "200":
+          description: Сервис здоров и готов
+          content:
+            application/json:
+              schema:
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  ready:
+                    type: boolean
+                    example: true
+        "503":
+          description: Сервис запущен, но ещё не готов (первый пересчёт не завершён)
+          content:
+            application/json:
+              schema:
+                properties:
+                  status:
+                    type: string
+                    example: "not_ready"
+                  ready:
+                    type: boolean
+                    example: false
+
+  /metrics:
+    get:
+      summary: Prometheus метрики
+      description: |
+        Возвращает метрики в формате Prometheus (text/plain).
+        Основные метрики:
+        - trending_search_events_total (status)
+        - trending_search_api_requests_total (endpoint, status)
+        - trending_search_recalc_duration_seconds
+        - trending_search_memory_unique_queries
+        - trending_search_top_cache_timestamp
+      operationId: getMetrics
+      responses:
+        "200":
+          description: Метрики Prometheus
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  schemas:
+    TrendItem:
+      type: object
+      properties:
+        query:
+          type: string
+          description: Поисковый запрос (нормализованный)
+          example: "iphone 15"
+        count:
+          type: integer
+          format: uint64
+          description: Количество уникальных событий за окно 5 минут
+          example: 4521
+        rank:
+          type: integer
+          description: Позиция в топе (1-based)
+          example: 1
+
+    TrendsResponse:
+      type: object
+      properties:
+        updated_at:
+          type: string
+          format: date-time
+          description: Время последнего пересчёта топа
+          example: "2026-05-26T12:00:00Z"
+        window_seconds:
+          type: integer
+          description: Размер окна агрегации в секундах (5 минут = 300)
+          example: 300
+        total_queries:
+          type: integer
+          description: Количество уникальных запросов в окне
+          example: 15420
+        trends:
+          type: array
+          items:
+            $ref: "#/components/schemas/TrendItem"
+
+    StoplistAddRequest:
+      type: object
+      required:
+        - word
+        - match_type
+      properties:
+        word:
+          type: string
+          description: Слово или паттерн для блокировки
+          example: "xxx"
+        match_type:
+          type: string
+          enum: [exact, contains]
+          description: |
+            exact — точное совпадение запроса (O(1) фильтр входящего потока).
+            contains — поиск подстроки (проверяется только для top-N при пересчёте).
+          example: "exact"
+
+    StoplistResponse:
+      type: object
+      properties:
+        exact:
+          type: array
+          items:
+            type: string
+          description: Слова для точного совпадения
+          example: ["xxx", "порно"]
+        patterns:
+          type: array
+          items:
+            type: string
+          description: Паттерны для поиска подстроки
+          example: ["spam"]
+
+    StatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: "added"
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Описание ошибки
+          example: "invalid json"
